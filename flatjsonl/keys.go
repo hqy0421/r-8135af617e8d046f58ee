@@ -26,6 +26,47 @@ type flKey struct {
 	transposeTrimmed string
 	extractors       []extractor
 	parent           uint64
+
+	// transposeParents holds ancestor array indexes (outermost first) for
+	// keys matched by a nested transpose prefix (with [] segments), e.g. the
+	// shipment index for ".shipments.[].cells". Together with transposeKey
+	// (the own index) it identifies a transposed row within a source line,
+	// so two-level array order can be restored from the transposed details.
+	transposeParents []intOrString
+}
+
+// transposeHasParent is true for keys matched by a nested transpose prefix.
+func (k flKey) transposeHasParent() bool {
+	return len(k.transposeParents) > 0
+}
+
+// transposeParentKey is the index of the immediate parent array element.
+// It must only be called if transposeHasParent is true.
+func (k flKey) transposeParentKey() intOrString {
+	return k.transposeParents[len(k.transposeParents)-1]
+}
+
+// transposeRowKey identifies a row of a transposed table within one source
+// line: ancestor array indexes (for nested transpose) and the own array
+// index/object property.
+func (k flKey) transposeRowKey() string {
+	switch len(k.transposeParents) {
+	case 0:
+		return k.transposeKey.String()
+	case 1:
+		return k.transposeParents[0].String() + "\x1f" + k.transposeKey.String()
+	default:
+		var sb strings.Builder
+
+		for _, p := range k.transposeParents {
+			sb.WriteString(p.String())
+			sb.WriteByte('\x1f')
+		}
+
+		sb.WriteString(k.transposeKey.String())
+
+		return sb.String()
+	}
 }
 
 func (k *flKey) UpdateType(u Type) {
@@ -90,13 +131,7 @@ func (p *Processor) initKey(pk, parent uint64, path []string, t Type, isZero boo
 	k.canonical = p.ck(key)
 	k.parent = parent
 
-	for tk, dst := range p.cfg.Transpose {
-		if len(k.original) > len(tk) && strings.HasPrefix(k.original, tk) {
-			scanTransposedKey(dst, tk, &k)
-
-			break
-		}
-	}
+	p.matchTranspose(&k)
 
 	for r, x := range p.extractRegex {
 		if r.MatchString(key) {
@@ -218,48 +253,113 @@ func (p *Processor) collectKeyCardinality(k flKey) {
 	}
 }
 
-func scanTransposedKey(dst string, tk string, k *flKey) {
-	trimmed := strings.TrimPrefix(k.original, tk)
-	if len(trimmed) == 0 {
-		return
+// transposeWildcard is a transpose prefix segment that matches any single
+// array index segment (e.g. "[0]") and captures it as the parent index.
+const transposeWildcard = "[]"
+
+// transposePrefix is a parsed entry of the transpose config map.
+type transposePrefix struct {
+	segments []string
+	dst      string
+}
+
+// parseTransposePrefixes prepares transpose config for deterministic matching:
+// prefixes with more segments (more specific) come first, ties are broken by
+// the joined prefix string.
+func parseTransposePrefixes(transpose map[string]string) []transposePrefix {
+	res := make([]transposePrefix, 0, len(transpose))
+
+	for tk, dst := range transpose {
+		res = append(res, transposePrefix{
+			segments: strings.Split(strings.TrimPrefix(tk, "."), "."),
+			dst:      dst,
+		})
 	}
 
-	if trimmed[0] == '.' {
-		trimmed = trimmed[1:]
+	sort.Slice(res, func(i, j int) bool {
+		if len(res[i].segments) != len(res[j].segments) {
+			return len(res[i].segments) > len(res[j].segments)
+		}
 
-		if len(trimmed) == 0 {
+		return strings.Join(res[i].segments, ".") < strings.Join(res[j].segments, ".")
+	})
+
+	return res
+}
+
+// matchTranspose assigns transpose destination to the key if it matches one
+// of the configured transpose prefixes.
+func (p *Processor) matchTranspose(k *flKey) {
+	for _, tp := range p.transposePrefixes {
+		if tp.match(k) {
 			return
 		}
 	}
+}
 
-	// Array.
-	if trimmed[0] == '[' {
-		pos := strings.Index(trimmed, "]")
-		idx := trimmed[1:pos]
+// match checks if the key path is under the transpose prefix and, if so,
+// fills transpose properties of the key. A "[]" prefix segment matches any
+// single array index segment and captures it as an ancestor index.
+func (tp transposePrefix) match(k *flKey) bool {
+	path := k.path
 
-		i, err := strconv.Atoi(idx)
-		if err != nil {
-			panic("BUG: failed to parse idx " + idx + ": " + err.Error())
+	// Key must be strictly longer than the prefix to have a transpose key.
+	if len(path) <= len(tp.segments) {
+		return false
+	}
+
+	var parents []intOrString
+
+	for i, seg := range tp.segments {
+		if seg == transposeWildcard {
+			idx, ok := parseArrayIndex(path[i])
+			if !ok {
+				return false
+			}
+
+			parents = append(parents, intOrString{t: TypeInt, i: idx})
+
+			continue
 		}
 
-		trimmed = trimmed[pos+1:]
-		k.transposeKey = intOrString{t: TypeInt, i: i}
+		if seg != path[i] {
+			return false
+		}
+	}
+
+	rest := path[len(tp.segments):]
+
+	// The first remaining segment is the transpose key: array index or object property.
+	if idx, ok := parseArrayIndex(rest[0]); ok {
+		k.transposeKey = intOrString{t: TypeInt, i: idx}
 	} else {
-		if pos := strings.Index(trimmed, "."); pos > 0 {
-			k.transposeKey = intOrString{t: TypeString, s: trimmed[0:pos]}
-			trimmed = trimmed[pos:]
-		} else {
-			k.transposeKey = intOrString{t: TypeString, s: trimmed}
-			trimmed = ""
-		}
+		k.transposeKey = intOrString{t: TypeString, s: rest[0]}
 	}
 
-	if trimmed == "" {
-		trimmed = "._value"
+	trimmed := "._value"
+	if len(rest) > 1 {
+		trimmed = "." + strings.Join(rest[1:], ".")
 	}
 
-	k.transposeDst = dst
+	k.transposeDst = tp.dst
 	k.transposeTrimmed = trimmed
+	k.transposeParents = parents
+
+	return true
+}
+
+// parseArrayIndex parses a path segment of form "[123]" into an array index.
+func parseArrayIndex(seg string) (int, bool) {
+	if len(seg) < 3 || seg[0] != '[' || seg[len(seg)-1] != ']' {
+		return 0, false
+	}
+
+	i, err := strconv.Atoi(seg[1 : len(seg)-1])
+	if err != nil || i < 0 {
+		return 0, false
+	}
+
+	return i, true
 }
 
 type hasher struct {

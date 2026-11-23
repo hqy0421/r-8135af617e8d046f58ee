@@ -1,0 +1,6 @@
+{"msgId":"M1","shipments":[{"id":"S1","cells":[{"code":"A1","w":1.5},{"code":"A2","w":2}]},{"id":"S2","cells":[]},{"id":"S3","cells":[{"code":"B1","w":3.25}]}]}
+{"msgId":"BAD","shipments":[broken
+{"msgId":"M2","shipments":[{"id":"S4","cells":[{"code":"C1","w":4}]}]}
+not json at all
+{"msgId":"M3","shipments":[]}
+{"msgId":"M4","shipments":[{"id":"S5","cells":[{"code":"D1","w":5},{"code":"D2","w":6.5}]}]}

@@ -150,14 +150,19 @@ func (c *CSVWriter) receiveRow(seq int64, values []Value) (transposedRows [][]st
 
 			k := c.b.keys[i]
 
-			transposeKey := k.transposeKey.String()
-			row := transposedRowsIdx[transposeKey]
+			rowKey := k.transposeRowKey()
+			row := transposedRowsIdx[rowKey]
 
 			if row == nil {
 				row = make([]string, len(c.b.trimmedKeys))
 				row[0] = Format(float64(seq)) // Add sequence.
-				row[1] = transposeKey         // Add array idx/object property.
-				transposedRowsIdx[transposeKey] = row
+
+				if c.b.hasParentIndex {
+					row[c.b.parentIndexPos] = k.transposeParentKey().String() // Add parent array idx.
+				}
+
+				row[c.b.indexPos] = k.transposeKey.String() // Add array idx/object property.
+				transposedRowsIdx[rowKey] = row
 				transposedRows = append(transposedRows, row)
 			}
 

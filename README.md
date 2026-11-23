@@ -299,6 +299,16 @@ This is possible with `transpose` configuration file field ([example](./flatjson
 it accepts a map of key prefixes to transposed table name. During processing, values found in the prefixed keys would
 be moved as multiple rows in transposed table.
 
+Transposed tables share the source record key with the parent table: every detail row has `._sequence` (and `_seq_id`
+in SQL outputs) of the source line, so parent and detail tables can be joined. The position of the detail element is
+kept in `._index`.
+
+A transpose prefix can cross an array level with a `[]` segment to transpose nested arrays, e.g. with
+`{".shipments": "shipment", ".shipments.[].cells": "cell"}` each element of `cells` arrays becomes a row of the `cell`
+table. Such nested tables additionally have `._parent_index` with the index of the parent array element, so two-level
+array order can be restored from the detail rows (e.g. `ORDER BY ._sequence, ._parent_index, ._index`) and details can
+be joined to the parent shipment rows on `(._sequence, ._parent_index) = (._sequence, ._index)`.
+
 ### Extracting data from strings
 
 With `extractValuesRegex` config parameter, you can set a map of `regexp` matching key name to value format. 

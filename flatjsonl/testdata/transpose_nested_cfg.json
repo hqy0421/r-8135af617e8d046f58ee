@@ -1,0 +1,6 @@
+{
+  "transpose": {
+    ".shipments": "shipment",
+    ".shipments.[].cells": "cell"
+  }
+}

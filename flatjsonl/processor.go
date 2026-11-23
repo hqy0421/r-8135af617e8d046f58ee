@@ -46,6 +46,9 @@ type Processor struct {
 	replaceKeys  map[string]string
 	replaceByKey map[string]string
 
+	// transposePrefixes are parsed from cfg.Transpose, sorted for deterministic matching.
+	transposePrefixes []transposePrefix
+
 	// keys are ordered by replaced column names, indexes match values of includeKeys.
 	keys []flKey
 
@@ -153,6 +156,8 @@ func NewProcessor(f Flags, cfg Config, inputs ...Input) (*Processor, error) { //
 	}
 
 	p.rd.Processor = p
+
+	p.transposePrefixes = parseTransposePrefixes(cfg.Transpose)
 
 	switch f.Verbosity {
 	case 0:

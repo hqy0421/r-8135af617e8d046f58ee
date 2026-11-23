@@ -145,6 +145,12 @@ type baseWriter struct {
 	transposed   map[string]*baseWriter
 	trimmedKeys  map[string]idxKey
 
+	// hasParentIndex is true for nested transposed tables (e.g. ".shipments.[].cells")
+	// that carry the parent array index in a dedicated column.
+	hasParentIndex bool
+	parentIndexPos int
+	indexPos       int
+
 	// transposedMapping maps original key index to reduced set of trimmed keys.
 	transposedMapping map[int]int
 
@@ -154,6 +160,14 @@ type baseWriter struct {
 func (b *baseWriter) setupKeys(keys []flKey) {
 	b.keys = keys
 
+	// Pre-create nested transposed writers so that their fixed columns
+	// (._sequence, ._parent_index, ._index) precede data columns.
+	for _, key := range keys {
+		if key.transposeDst != "" && key.transposeHasParent() {
+			b.transposedWriter(key.transposeDst, keys, true)
+		}
+	}
+
 	for i, key := range keys {
 		if key.transposeDst == "" {
 			b.keyIndexes = append(b.keyIndexes, i)
@@ -161,7 +175,7 @@ func (b *baseWriter) setupKeys(keys []flKey) {
 			continue
 		}
 
-		tw := b.transposedWriter(key.transposeDst, keys)
+		tw := b.transposedWriter(key.transposeDst, keys, false)
 
 		tw.keyIndexes = append(tw.keyIndexes, i)
 		tw.indexType = key.transposeKey.t
@@ -200,8 +214,13 @@ func (b *baseWriter) initFilteredKeys() {
 		b.filteredKeys[i.idx] = i.k
 	}
 
-	b.filteredKeys[0].t = TypeInt     // .sequence
-	b.filteredKeys[1].t = b.indexType // .index
+	b.filteredKeys[0].t = TypeInt // ._sequence
+
+	if b.hasParentIndex {
+		b.filteredKeys[b.parentIndexPos].t = TypeInt // ._parent_index
+	}
+
+	b.filteredKeys[b.indexPos].t = b.indexType // ._index
 
 	for o, t := range b.transposedMapping {
 		k := b.filteredKeys[t]
@@ -210,7 +229,7 @@ func (b *baseWriter) initFilteredKeys() {
 	}
 }
 
-func (b *baseWriter) transposedWriter(dst string, keys []flKey) *baseWriter {
+func (b *baseWriter) transposedWriter(dst string, keys []flKey, nested bool) *baseWriter {
 	tw := b.transposed[dst]
 	if tw != nil {
 		return tw
@@ -224,16 +243,29 @@ func (b *baseWriter) transposedWriter(dst string, keys []flKey) *baseWriter {
 
 	tw.isTransposed = true
 	tw.keys = keys
+	tw.indexPos = 1
 	tw.trimmedKeys = map[string]idxKey{
 		"._sequence": {idx: 0, k: flKey{
 			original: "._sequence",
 			replaced: b.p.prepareKey("._sequence"),
 		}},
-		"._index": {idx: 1, k: flKey{
-			original: "._index",
-			replaced: b.p.prepareKey("._index"),
-		}},
 	}
+
+	if nested {
+		tw.hasParentIndex = true
+		tw.parentIndexPos = 1
+		tw.indexPos = 2
+		tw.trimmedKeys["._parent_index"] = idxKey{idx: 1, k: flKey{
+			original: "._parent_index",
+			replaced: b.p.prepareKey("._parent_index"),
+		}}
+	}
+
+	tw.trimmedKeys["._index"] = idxKey{idx: tw.indexPos, k: flKey{
+		original: "._index",
+		replaced: b.p.prepareKey("._index"),
+	}}
+
 	tw.transposedMapping = map[int]int{}
 
 	b.transposed[dst] = tw
@@ -274,14 +306,19 @@ func (b *baseWriter) receiveRow(seq int64, values []Value) (transposedRows [][]s
 
 			k := b.keys[i]
 
-			transposeKey := k.transposeKey.String()
-			row := transposedRowsIdx[transposeKey]
+			rowKey := k.transposeRowKey()
+			row := transposedRowsIdx[rowKey]
 
 			if row == nil {
 				row = make([]string, len(b.trimmedKeys))
 				row[0] = strconv.Itoa(int(seq)) // Add sequence.
-				row[1] = transposeKey           // Add array idx/object property.
-				transposedRowsIdx[transposeKey] = row
+
+				if b.hasParentIndex {
+					row[b.parentIndexPos] = k.transposeParentKey().String() // Add parent array idx.
+				}
+
+				row[b.indexPos] = k.transposeKey.String() // Add array idx/object property.
+				transposedRowsIdx[rowKey] = row
 				transposedRows = append(transposedRows, row)
 			}
 
@@ -314,8 +351,8 @@ func (b *baseWriter) receiveTransposedRowValues(seq int64, values []Value) (tran
 
 		k := b.keys[i]
 
-		transposeKey := k.transposeKey.String()
-		row := transposedRowsIdx[transposeKey]
+		rowKey := k.transposeRowKey()
+		row := transposedRowsIdx[rowKey]
 
 		if row == nil {
 			row = make([]Value, len(b.trimmedKeys))
@@ -323,8 +360,13 @@ func (b *baseWriter) receiveTransposedRowValues(seq int64, values []Value) (tran
 				Type:   TypeFloat,
 				Number: float64(seq),
 			} // Add sequence.
-			row[1] = k.transposeKey.Value() // Add array idx/object property.
-			transposedRowsIdx[transposeKey] = row
+
+			if b.hasParentIndex {
+				row[b.parentIndexPos] = k.transposeParentKey().Value() // Add parent array idx.
+			}
+
+			row[b.indexPos] = k.transposeKey.Value() // Add array idx/object property.
+			transposedRowsIdx[rowKey] = row
 			transposedRows = append(transposedRows, row)
 		}
 

@@ -3,6 +3,7 @@ package flatjsonl_test
 import (
 	"bytes"
 	"compress/gzip"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -771,6 +772,242 @@ func TestNewProcessor_transpose_pg_dump(t *testing.T) {
 	ex, err := os.ReadFile("testdata/transpose.pg.sql.expected")
 	require.NoError(t, err)
 	assertFileEquals(t, "testdata/transpose.pg.sql", string(ex))
+}
+
+func TestNewProcessor_transposeNested(t *testing.T) {
+	f := flatjsonl.Flags{}
+	f.AddSequence = true
+	f.Input = "testdata/transpose_nested.jsonl"
+	f.Output = "testdata/transpose_nested.csv,testdata/transpose_nested.raw"
+	f.SQLTable = "whatever"
+	f.Concurrency = 1
+	f.RawDelim = ","
+	f.ReplaceKeys = true
+	f.PrepareOutput()
+
+	cj, err := os.ReadFile("testdata/transpose_nested_cfg.json")
+	require.NoError(t, err)
+
+	var cfg flatjsonl.Config
+
+	require.NoError(t, json.Unmarshal(cj, &cfg))
+
+	proc, err := flatjsonl.NewProcessor(f, cfg, f.Inputs()...)
+	require.NoError(t, err)
+
+	require.NoError(t, proc.Process())
+
+	// Parent table keeps one row per source line, malformed lines 2 and 4
+	// stay as empty rows so that subsequent records do not shift.
+	assertFileEquals(t, "testdata/transpose_nested.csv",
+		`sequence,msg_id
+1,M1
+2,
+3,M2
+4,
+5,M3
+6,M4
+`)
+	assertFileEquals(t, "testdata/transpose_nested.raw",
+		`1,M1
+2,
+3,M2
+4,
+5,M3
+6,M4
+`)
+
+	// Shipment details share the source record key (sequence) with the parent
+	// table, first-level array order is in index.
+	assertFileEquals(t, "testdata/transpose_nested_shipment.csv",
+		`sequence,index,id
+1,0,S1
+1,1,S2
+1,2,S3
+3,0,S4
+6,0,S5
+`)
+	assertFileEquals(t, "testdata/transpose_nested_shipment.raw",
+		`1,0,S1
+1,1,S2
+1,2,S3
+3,0,S4
+6,0,S5
+`)
+
+	// Cell details carry both array indexes (parent_index is the shipment
+	// index), so two-level array order can be restored from the details.
+	// Shipments with empty cells and malformed lines leave no rows behind.
+	assertFileEquals(t, "testdata/transpose_nested_cell.csv",
+		`sequence,parent_index,index,code,w
+1,0,0,A1,1.5
+1,0,1,A2,2
+1,2,0,B1,3.25
+3,0,0,C1,4
+6,0,0,D1,5
+6,0,1,D2,6.5
+`)
+	assertFileEquals(t, "testdata/transpose_nested_cell.raw",
+		`1,0,0,A1,1.5
+1,0,1,A2,2
+1,2,0,B1,3.25
+3,0,0,C1,4
+6,0,0,D1,5
+6,0,1,D2,6.5
+`)
+}
+
+func TestNewProcessor_transposeNested_sqlite(t *testing.T) {
+	f := flatjsonl.Flags{}
+	f.AddSequence = true
+	f.Input = "testdata/transpose_nested.jsonl"
+	f.Output = "testdata/transpose_nested.sqlite"
+	f.SQLTable = "whatever"
+	f.Concurrency = 3
+	f.PrepareOutput()
+
+	if err := os.Remove("testdata/transpose_nested.sqlite"); err != nil {
+		require.Contains(t, err.Error(), "no such file or directory")
+	}
+
+	t.Cleanup(func() { require.NoError(t, os.Remove("testdata/transpose_nested.sqlite")) })
+
+	cj, err := os.ReadFile("testdata/transpose_nested_cfg.json")
+	require.NoError(t, err)
+
+	var cfg flatjsonl.Config
+
+	require.NoError(t, json.Unmarshal(cj, &cfg))
+
+	proc, err := flatjsonl.NewProcessor(f, cfg, f.Inputs()...)
+	require.NoError(t, err)
+
+	require.NoError(t, proc.Process())
+
+	db, err := sql.Open("sqlite", "testdata/transpose_nested.sqlite")
+	require.NoError(t, err)
+
+	defer func() { require.NoError(t, db.Close()) }()
+
+	// Parent table keeps one row per source line, malformed lines stay empty.
+	rows, err := db.Query(`SELECT _seq_id, ".msgId" FROM whatever ORDER BY _seq_id`)
+	require.NoError(t, err)
+
+	var parentRows [][2]string
+
+	for rows.Next() {
+		var (
+			seq   int64
+			msgID sql.NullString
+		)
+
+		require.NoError(t, rows.Scan(&seq, &msgID))
+		parentRows = append(parentRows, [2]string{strconv.FormatInt(seq, 10), msgID.String})
+	}
+
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+
+	assert.Equal(t, [][2]string{
+		{"1", "M1"},
+		{"2", ""}, // Malformed JSON.
+		{"3", "M2"},
+		{"4", ""}, // Not a JSON line.
+		{"5", "M3"},
+		{"6", "M4"},
+	}, parentRows)
+
+	// Cell details are visible together with the source record key and both
+	// array indexes, so two-level array order can be restored with a join.
+	rows, err = db.Query(`SELECT c._seq_id, c."._parent_index", c."._index", c.".code"
+FROM whatever_cell c ORDER BY c._seq_id, c."._parent_index", c."._index"`)
+	require.NoError(t, err)
+
+	var cellRows [][4]string
+
+	for rows.Next() {
+		var (
+			seq, parentIdx, idx int64
+			code                string
+		)
+
+		require.NoError(t, rows.Scan(&seq, &parentIdx, &idx, &code))
+		cellRows = append(cellRows, [4]string{
+			strconv.FormatInt(seq, 10), strconv.FormatInt(parentIdx, 10), strconv.FormatInt(idx, 10), code,
+		})
+	}
+
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+
+	assert.Equal(t, [][4]string{
+		{"1", "0", "0", "A1"},
+		{"1", "0", "1", "A2"},
+		{"1", "2", "0", "B1"},
+		{"3", "0", "0", "C1"},
+		{"6", "0", "0", "D1"},
+		{"6", "0", "1", "D2"},
+	}, cellRows)
+
+	// No orphans: every cell joins to its shipment and to the parent message.
+	var orphans int
+
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM whatever_cell c
+LEFT JOIN whatever_shipment s ON s._seq_id = c._seq_id AND s."._index" = c."._parent_index"
+LEFT JOIN whatever m ON m._seq_id = c._seq_id
+WHERE s._seq_id IS NULL OR m._seq_id IS NULL`).Scan(&orphans))
+	assert.Equal(t, 0, orphans)
+}
+
+func TestNewProcessor_transposeNested_parquet(t *testing.T) {
+	f := flatjsonl.Flags{}
+	f.AddSequence = true
+	f.Input = "testdata/transpose_nested.jsonl"
+	f.Parquet = "testdata/transpose_nested.parquet"
+	f.ReplaceKeys = true
+	f.Concurrency = 1
+
+	cj, err := os.ReadFile("testdata/transpose_nested_cfg.json")
+	require.NoError(t, err)
+
+	var cfg flatjsonl.Config
+
+	require.NoError(t, json.Unmarshal(cj, &cfg))
+
+	for _, fn := range []string{
+		f.Parquet,
+		"testdata/transpose_nested_shipment.parquet",
+		"testdata/transpose_nested_cell.parquet",
+	} {
+		require.NoError(t, os.RemoveAll(fn))
+		t.Cleanup(func(name string) func() { return func() { require.NoError(t, os.Remove(name)) } }(fn))
+	}
+
+	proc, err := flatjsonl.NewProcessor(f, cfg, f.Inputs()...)
+	require.NoError(t, err)
+	require.NoError(t, proc.Process())
+
+	assert.Len(t, readParquetRows(t, f.Parquet), 6)
+	assert.Len(t, readParquetRows(t, "testdata/transpose_nested_shipment.parquet"), 5)
+
+	cellRows := readParquetRows(t, "testdata/transpose_nested_cell.parquet")
+	require.Len(t, cellRows, 6)
+
+	// Both array indexes are available to restore two-level array order.
+	assert.Equal(t, map[string]string{
+		"sequence":     "1",
+		"parent_index": "0",
+		"index":        "0",
+		"code":         "A1",
+		"w":            "1.5",
+	}, cellRows[0])
+	assert.Equal(t, map[string]string{
+		"sequence":     "1",
+		"parent_index": "2",
+		"index":        "0",
+		"code":         "B1",
+		"w":            "3.25",
+	}, cellRows[2])
 }
 
 func assertFileEquals(t *testing.T, fn string, contents string) {
